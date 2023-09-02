@@ -1,16 +1,19 @@
-/* NOTE(anton2920): it's a freebsd version. */
-
-// Copyright 2009 The Go Authors. All rights reserved.
+// Copyright 2010 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 #include "textflag.h"
 
-// On FreeBSD argc/argv are passed in DI, not SP, so we can't use _rt0_amd64.
-TEXT _rt0_amd64_freebsd(SB),NOSPLIT,$-8
-	LEAQ	8(DI), SI // argv
-	MOVQ	0(DI), DI // argc
-	JMP	runtime·rt0_go(SB)
+TEXT _rt0_amd64_plan9(SB),NOSPLIT,$24
+	MOVQ	AX, _tos(SB)
+	LEAQ	16(SP), AX
+	MOVQ	AX, _privates(SB)
+	MOVL	$1, _nprivates(SB)
+	MOVL	inargc-8(FP), DI
+	LEAQ	inargv+0(FP), SI
+	MOVQ	$runtime·rt0_go(SB), AX
+	JMP	AX
 
-TEXT _rt0_amd64_freebsd_lib(SB),NOSPLIT,$0
-	JMP	_rt0_amd64_lib(SB)
+GLOBL _tos(SB), NOPTR, $8
+GLOBL _privates(SB), NOPTR, $8
+GLOBL _nprivates(SB), NOPTR, $4

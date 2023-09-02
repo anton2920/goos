@@ -27,6 +27,8 @@ run()
 }
 
 GOROOT=`go env GOROOT`; export GOROOT
+GOOS=plan9; export GOOS
+GOARCH=amd64; export GOARCH
 GOAMD64=v3; export GOAMD64
 
 GOMAXPROCS=4; export GOMAXPROCS

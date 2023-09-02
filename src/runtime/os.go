@@ -1,6 +1,4 @@
-/* NOTE(anton2920): it's a freebsd version. */
-
-// Copyright 2011 The Go Authors. All rights reserved.
+// Copyright 2010 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -8,337 +6,214 @@ package runtime
 
 import (
 	"internal/abi"
-	"internal/goarch"
+	"runtime/internal/atomic"
 	"unsafe"
 )
 
-const (
-	_SS_DISABLE  = 4
-	_NSIG        = 33
-	_SI_USER     = 0x10001
-	_SIG_BLOCK   = 1
-	_SIG_UNBLOCK = 2
-	_SIG_SETMASK = 3
-)
-
-type mOS struct{}
-
-//go:noescape
-func thr_new(param *thrparam, size int32) int32
-
-//go:noescape
-func sigaltstack(new, old *stackt)
-
-//go:noescape
-func sigprocmask(how int32, new, old *sigset)
-
-//go:noescape
-func setitimer(mode int32, new, old *itimerval)
-
-//go:noescape
-func sysctl(mib *uint32, miblen uint32, out *byte, size *uintptr, dst *byte, ndst uintptr) int32
-
-func raiseproc(sig uint32)
-
-func thr_self() thread
-func thr_kill(tid thread, sig int)
-
-//go:noescape
-func sys_umtx_op(addr *uint32, mode int32, val uint32, uaddr1 uintptr, ut *umtx_time) int32
-
-func osyield()
-
-//go:nosplit
-func osyield_no_g() {
-	osyield()
+type mOS struct {
+	waitsemacount uint32
+	notesig       *int8
+	errstr        *byte
+	ignoreHangup  bool
 }
 
-func kqueue() int32
+func closefd(fd int32) int32
 
 //go:noescape
-func kevent(kq int32, ch *keventt, nch int32, ev *keventt, nev int32, ts *timespec) int32
+func open(name *byte, mode, perm int32) int32
 
-func pipe2(flags int32) (r, w int32, errno int32)
-func fcntl(fd, cmd, arg int32) (ret int32, errno int32)
+//go:noescape
+func pread(fd int32, buf unsafe.Pointer, nbytes int32, offset int64) int32
 
-func issetugid() int32
+//go:noescape
+func pwrite(fd int32, buf unsafe.Pointer, nbytes int32, offset int64) int32
 
-// From FreeBSD's <sys/sysctl.h>
-const (
-	_CTL_HW      = 6
-	_HW_PAGESIZE = 7
-)
+func seek(fd int32, offset int64, whence int32) int64
 
-var sigset_all = sigset{[4]uint32{^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0)}}
+//go:noescape
+func exits(msg *byte)
 
-// Undocumented numbers from FreeBSD's lib/libc/gen/sysctlnametomib.c.
-const (
-	_CTL_QUERY     = 0
-	_CTL_QUERY_MIB = 3
-)
+//go:noescape
+func brk_(addr unsafe.Pointer) int32
 
-// sysctlnametomib fill mib with dynamically assigned sysctl entries of name,
-// return count of effected mib slots, return 0 on error.
-func sysctlnametomib(name []byte, mib *[_CTL_MAXNAME]uint32) uint32 {
-	oid := [2]uint32{_CTL_QUERY, _CTL_QUERY_MIB}
-	miblen := uintptr(_CTL_MAXNAME)
-	if sysctl(&oid[0], 2, (*byte)(unsafe.Pointer(mib)), &miblen, (*byte)(unsafe.Pointer(&name[0])), (uintptr)(len(name))) < 0 {
-		return 0
+func sleep(ms int32) int32
+
+func rfork(flags int32) int32
+
+//go:noescape
+func plan9_semacquire(addr *uint32, block int32) int32
+
+//go:noescape
+func plan9_tsemacquire(addr *uint32, ms int32) int32
+
+//go:noescape
+func plan9_semrelease(addr *uint32, count int32) int32
+
+//go:noescape
+func notify(fn unsafe.Pointer) int32
+
+func noted(mode int32) int32
+
+//go:noescape
+func nsec(*int64) int64
+
+//go:noescape
+func sigtramp(ureg, note unsafe.Pointer)
+
+func setfpmasks()
+
+//go:noescape
+func tstart_plan9(newm *m)
+
+func errstr() string
+
+type _Plink uintptr
+
+func sigpanic() {
+	gp := getg()
+	if !canpanic() {
+		throw("unexpected signal during runtime execution")
 	}
-	miblen /= unsafe.Sizeof(uint32(0))
-	if miblen <= 0 {
-		return 0
+
+	note := gostringnocopy((*byte)(unsafe.Pointer(gp.m.notesig)))
+	switch gp.sig {
+	case _SIGRFAULT, _SIGWFAULT:
+		i := indexNoFloat(note, "addr=")
+		if i >= 0 {
+			i += 5
+		} else if i = indexNoFloat(note, "va="); i >= 0 {
+			i += 3
+		} else {
+			panicmem()
+		}
+		addr := note[i:]
+		gp.sigcode1 = uintptr(atolwhex(addr))
+		if gp.sigcode1 < 0x1000 {
+			panicmem()
+		}
+		if gp.paniconfault {
+			panicmemAddr(gp.sigcode1)
+		}
+		if inUserArenaChunk(gp.sigcode1) {
+			// We could check that the arena chunk is explicitly set to fault,
+			// but the fact that we faulted on accessing it is enough to prove
+			// that it is.
+			print("accessed data from freed user arena ", hex(gp.sigcode1), "\n")
+		} else {
+			print("unexpected fault address ", hex(gp.sigcode1), "\n")
+		}
+		throw("fault")
+	case _SIGTRAP:
+		if gp.paniconfault {
+			panicmem()
+		}
+		throw(note)
+	case _SIGINTDIV:
+		panicdivide()
+	case _SIGFLOAT:
+		panicfloat()
+	default:
+		panic(errorString(note))
 	}
-	return uint32(miblen)
 }
 
-const (
-	_CPU_CURRENT_PID = -1 // Current process ID.
-)
-
-//go:noescape
-func cpuset_getaffinity(level int, which int, id int64, size int, mask *byte) int32
-
-//go:systemstack
-func getncpu() int32 {
-	// Use a large buffer for the CPU mask. We're on the system
-	// stack, so this is fine, and we can't allocate memory for a
-	// dynamically-sized buffer at this point.
-	const maxCPUs = 64 * 1024
-	var mask [maxCPUs / 8]byte
-	var mib [_CTL_MAXNAME]uint32
-
-	// According to FreeBSD's /usr/src/sys/kern/kern_cpuset.c,
-	// cpuset_getaffinity return ERANGE when provided buffer size exceed the limits in kernel.
-	// Querying kern.smp.maxcpus to calculate maximum buffer size.
-	// See https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=200802
-
-	// Variable kern.smp.maxcpus introduced at Dec 23 2003, revision 123766,
-	// with dynamically assigned sysctl entries.
-	miblen := sysctlnametomib([]byte("kern.smp.maxcpus"), &mib)
-	if miblen == 0 {
-		return 1
+// indexNoFloat is bytealg.IndexString but safe to use in a note
+// handler.
+func indexNoFloat(s, t string) int {
+	if len(t) == 0 {
+		return 0
 	}
-
-	// Query kern.smp.maxcpus.
-	dstsize := uintptr(4)
-	maxcpus := uint32(0)
-	if sysctl(&mib[0], miblen, (*byte)(unsafe.Pointer(&maxcpus)), &dstsize, nil, 0) != 0 {
-		return 1
-	}
-
-	maskSize := int(maxcpus+7) / 8
-	if maskSize < goarch.PtrSize {
-		maskSize = goarch.PtrSize
-	}
-	if maskSize > len(mask) {
-		maskSize = len(mask)
-	}
-
-	if cpuset_getaffinity(_CPU_LEVEL_WHICH, _CPU_WHICH_PID, _CPU_CURRENT_PID,
-		maskSize, (*byte)(unsafe.Pointer(&mask[0]))) != 0 {
-		return 1
-	}
-	n := int32(0)
-	for _, v := range mask[:maskSize] {
-		for v != 0 {
-			n += int32(v & 1)
-			v >>= 1
+	for i := 0; i < len(s); i++ {
+		if s[i] == t[0] && hasPrefix(s[i:], t) {
+			return i
 		}
 	}
-	if n == 0 {
-		return 1
+	return -1
+}
+
+func atolwhex(p string) int64 {
+	for hasPrefix(p, " ") || hasPrefix(p, "\t") {
+		p = p[1:]
+	}
+	neg := false
+	if hasPrefix(p, "-") || hasPrefix(p, "+") {
+		neg = p[0] == '-'
+		p = p[1:]
+		for hasPrefix(p, " ") || hasPrefix(p, "\t") {
+			p = p[1:]
+		}
+	}
+	var n int64
+	switch {
+	case hasPrefix(p, "0x"), hasPrefix(p, "0X"):
+		p = p[2:]
+		for ; len(p) > 0; p = p[1:] {
+			if '0' <= p[0] && p[0] <= '9' {
+				n = n*16 + int64(p[0]-'0')
+			} else if 'a' <= p[0] && p[0] <= 'f' {
+				n = n*16 + int64(p[0]-'a'+10)
+			} else if 'A' <= p[0] && p[0] <= 'F' {
+				n = n*16 + int64(p[0]-'A'+10)
+			} else {
+				break
+			}
+		}
+	case hasPrefix(p, "0"):
+		for ; len(p) > 0 && '0' <= p[0] && p[0] <= '7'; p = p[1:] {
+			n = n*8 + int64(p[0]-'0')
+		}
+	default:
+		for ; len(p) > 0 && '0' <= p[0] && p[0] <= '9'; p = p[1:] {
+			n = n*10 + int64(p[0]-'0')
+		}
+	}
+	if neg {
+		n = -n
 	}
 	return n
 }
 
-func getPageSize() uintptr {
-	mib := [2]uint32{_CTL_HW, _HW_PAGESIZE}
-	out := uint32(0)
-	nout := unsafe.Sizeof(out)
-	ret := sysctl(&mib[0], 2, (*byte)(unsafe.Pointer(&out)), &nout, nil, 0)
-	if ret >= 0 {
-		return uintptr(out)
-	}
-	return 0
-}
-
-// FreeBSD's umtx_op syscall is effectively the same as Linux's futex, and
-// thus the code is largely similar. See Linux implementation
-// and lock_futex.go for comments.
-
-//go:nosplit
-func futexsleep(addr *uint32, val uint32, ns int64) {
-	systemstack(func() {
-		futexsleep1(addr, val, ns)
-	})
-}
-
-func futexsleep1(addr *uint32, val uint32, ns int64) {
-	var utp *umtx_time
-	if ns >= 0 {
-		var ut umtx_time
-		ut._clockid = _CLOCK_MONOTONIC
-		ut._timeout.setNsec(ns)
-		utp = &ut
-	}
-	ret := sys_umtx_op(addr, _UMTX_OP_WAIT_UINT_PRIVATE, val, unsafe.Sizeof(*utp), utp)
-	if ret >= 0 || ret == -_EINTR || ret == -_ETIMEDOUT {
-		return
-	}
-	print("umtx_wait addr=", addr, " val=", val, " ret=", ret, "\n")
-	*(*int32)(unsafe.Pointer(uintptr(0x1005))) = 0x1005
-}
-
-//go:nosplit
-func futexwakeup(addr *uint32, cnt uint32) {
-	ret := sys_umtx_op(addr, _UMTX_OP_WAKE_PRIVATE, cnt, 0, nil)
-	if ret >= 0 {
-		return
-	}
-
-	systemstack(func() {
-		print("umtx_wake_addr=", addr, " ret=", ret, "\n")
-	})
-}
-
-func thr_start()
-
-// May run with m.p==nil, so write barriers are not allowed.
-//
-//go:nowritebarrier
-func newosproc(mp *m) {
-	stk := unsafe.Pointer(mp.g0.stack.hi)
-	if false {
-		print("newosproc stk=", stk, " m=", mp, " g=", mp.g0, " thr_start=", abi.FuncPCABI0(thr_start), " id=", mp.id, " ostk=", &mp, "\n")
-	}
-
-	param := thrparam{
-		start_func: abi.FuncPCABI0(thr_start),
-		arg:        unsafe.Pointer(mp),
-		stack_base: mp.g0.stack.lo,
-		stack_size: uintptr(stk) - mp.g0.stack.lo,
-		child_tid:  nil, // minit will record tid
-		parent_tid: nil,
-		tls_base:   unsafe.Pointer(&mp.tls[0]),
-		tls_size:   unsafe.Sizeof(mp.tls),
-	}
-
-	var oset sigset
-	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
-	ret := retryOnEAGAIN(func() int32 {
-		errno := thr_new(&param, int32(unsafe.Sizeof(param)))
-		// thr_new returns negative errno
-		return -errno
-	})
-	sigprocmask(_SIG_SETMASK, &oset, nil)
-	if ret != 0 {
-		print("runtime: failed to create new OS thread (have ", mcount(), " already; errno=", ret, ")\n")
-		throw("newosproc")
-	}
-}
-
-// Version of newosproc that doesn't require a valid G.
-//
-//go:nosplit
-func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
-	stack := sysAlloc(stacksize, &memstats.stacks_sys)
-	if stack == nil {
-		writeErrStr(failallocatestack)
-		exit(1)
-	}
-	// This code "knows" it's being called once from the library
-	// initialization code, and so it's using the static m0 for the
-	// tls and procid (thread) pointers. thr_new() requires the tls
-	// pointers, though the tid pointers can be nil.
-	// However, newosproc0 is currently unreachable because builds
-	// utilizing c-shared/c-archive force external linking.
-	param := thrparam{
-		start_func: uintptr(fn),
-		arg:        nil,
-		stack_base: uintptr(stack), //+stacksize?
-		stack_size: stacksize,
-		child_tid:  nil, // minit will record tid
-		parent_tid: nil,
-		tls_base:   unsafe.Pointer(&m0.tls[0]),
-		tls_size:   unsafe.Sizeof(m0.tls),
-	}
-
-	var oset sigset
-	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
-	ret := thr_new(&param, int32(unsafe.Sizeof(param)))
-	sigprocmask(_SIG_SETMASK, &oset, nil)
-	if ret < 0 {
-		writeErrStr(failthreadcreate)
-		exit(1)
-	}
-}
-
-// Called to do synchronous initialization of Go code built with
-// -buildmode=c-archive or -buildmode=c-shared.
-// None of the Go runtime is initialized.
-//
-//go:nosplit
-//go:nowritebarrierrec
-func libpreinit() {
-	initsig(true)
-}
-
-func osinit() {
-	ncpu = getncpu()
-	if physPageSize == 0 {
-		physPageSize = getPageSize()
-	}
-}
-
-var urandom_dev = []byte("/dev/urandom\x00")
-
-//go:nosplit
-func getRandomData(r []byte) {
-	fd := open(&urandom_dev[0], 0 /* O_RDONLY */, 0)
-	n := read(fd, unsafe.Pointer(&r[0]), int32(len(r)))
-	closefd(fd)
-	extendRandom(r, int(n))
-}
-
-func goenvs() {
-	goenvs_unix()
-}
+type sigset struct{}
 
 // Called to initialize a new m (including the bootstrap m).
 // Called on the parent thread (main thread in case of bootstrap), can allocate memory.
 func mpreinit(mp *m) {
+	// Initialize stack and goroutine for note handling.
 	mp.gsignal = malg(32 * 1024)
 	mp.gsignal.m = mp
+	mp.notesig = (*int8)(mallocgc(_ERRMAX, nil, true))
+	// Initialize stack for handling strings from the
+	// errstr system call, as used in package syscall.
+	mp.errstr = (*byte)(mallocgc(_ERRMAX, nil, true))
+}
+
+func sigsave(p *sigset) {
+}
+
+func msigrestore(sigmask sigset) {
+}
+
+//go:nosplit
+//go:nowritebarrierrec
+func clearSignalHandlers() {
+}
+
+func sigblock(exiting bool) {
 }
 
 // Called to initialize a new m (including the bootstrap m).
 // Called on the new thread, cannot allocate memory.
 func minit() {
-	getg().m.procid = uint64(thr_self())
-
-	// On FreeBSD before about April 2017 there was a bug such
-	// that calling execve from a thread other than the main
-	// thread did not reset the signal stack. That would confuse
-	// minitSignals, which calls minitSignalStack, which checks
-	// whether there is currently a signal stack and uses it if
-	// present. To avoid this confusion, explicitly disable the
-	// signal stack on the main thread when not running in a
-	// library. This can be removed when we are confident that all
-	// FreeBSD users are running a patched kernel. See issue #15658.
-	if gp := getg(); !isarchive && !islibrary && gp.m == &m0 && gp == gp.m.g0 {
-		st := stackt{ss_flags: _SS_DISABLE}
-		sigaltstack(&st, nil)
+	if atomic.Load(&exiting) != 0 {
+		exits(&emptystatus[0])
 	}
-
-	minitSignals()
+	// Mask all SSE floating-point exceptions
+	// when running on the 64-bit kernel.
+	setfpmasks()
 }
 
 // Called from dropm to undo the effect of an minit.
-//
-//go:nosplit
 func unminit() {
-	unminitSignals()
 }
 
 // Called from exitm, but not from drop, to undo the effect of thread-owned
@@ -346,164 +221,327 @@ func unminit() {
 func mdestroy(mp *m) {
 }
 
-func sigtramp()
+var sysstat = []byte("/dev/sysstat\x00")
 
-type sigactiont struct {
-	sa_handler uintptr
-	sa_flags   int32
-	sa_mask    sigset
-}
-
-// See os_freebsd2.go, os_freebsd_amd64.go for setsig function
-
-//go:nosplit
-//go:nowritebarrierrec
-func setsigstack(i uint32) {
-	var sa sigactiont
-	sigaction(i, nil, &sa)
-	if sa.sa_flags&_SA_ONSTACK != 0 {
-		return
+func getproccount() int32 {
+	var buf [2048]byte
+	fd := open(&sysstat[0], _OREAD, 0)
+	if fd < 0 {
+		return 1
 	}
-	sa.sa_flags |= _SA_ONSTACK
-	sigaction(i, &sa, nil)
+	ncpu := int32(0)
+	for {
+		n := read(fd, unsafe.Pointer(&buf), int32(len(buf)))
+		if n <= 0 {
+			break
+		}
+		for i := int32(0); i < n; i++ {
+			if buf[i] == '\n' {
+				ncpu++
+			}
+		}
+	}
+	closefd(fd)
+	if ncpu == 0 {
+		ncpu = 1
+	}
+	return ncpu
 }
 
-//go:nosplit
-//go:nowritebarrierrec
-func getsig(i uint32) uintptr {
-	var sa sigactiont
-	sigaction(i, nil, &sa)
-	return sa.sa_handler
+var devswap = []byte("/dev/swap\x00")
+var pagesize = []byte(" pagesize\n")
+
+func getPageSize() uintptr {
+	var buf [2048]byte
+	var pos int
+	fd := open(&devswap[0], _OREAD, 0)
+	if fd < 0 {
+		// There's not much we can do if /dev/swap doesn't
+		// exist. However, nothing in the memory manager uses
+		// this on Plan 9, so it also doesn't really matter.
+		return minPhysPageSize
+	}
+	for pos < len(buf) {
+		n := read(fd, unsafe.Pointer(&buf[pos]), int32(len(buf)-pos))
+		if n <= 0 {
+			break
+		}
+		pos += int(n)
+	}
+	closefd(fd)
+	text := buf[:pos]
+	// Find "<n> pagesize" line.
+	bol := 0
+	for i, c := range text {
+		if c == '\n' {
+			bol = i + 1
+		}
+		if bytesHasPrefix(text[i:], pagesize) {
+			// Parse number at the beginning of this line.
+			return uintptr(_atoi(text[bol:]))
+		}
+	}
+	// Again, the page size doesn't really matter, so use a fallback.
+	return minPhysPageSize
 }
 
-// setSignalstackSP sets the ss_sp field of a stackt.
-//
-//go:nosplit
-func setSignalstackSP(s *stackt, sp uintptr) {
-	s.ss_sp = sp
-}
-
-//go:nosplit
-//go:nowritebarrierrec
-func sigaddset(mask *sigset, i int) {
-	mask.__bits[(i-1)/32] |= 1 << ((uint32(i) - 1) & 31)
-}
-
-func sigdelset(mask *sigset, i int) {
-	mask.__bits[(i-1)/32] &^= 1 << ((uint32(i) - 1) & 31)
-}
-
-//go:nosplit
-func (c *sigctxt) fixsigcode(sig uint32) {
-}
-
-func setProcessCPUProfiler(hz int32) {
-	setProcessCPUProfilerTimer(hz)
-}
-
-func setThreadCPUProfiler(hz int32) {
-	setThreadCPUProfilerHz(hz)
-}
-
-//go:nosplit
-func validSIGPROF(mp *m, c *sigctxt) bool {
+func bytesHasPrefix(s, prefix []byte) bool {
+	if len(s) < len(prefix) {
+		return false
+	}
+	for i, p := range prefix {
+		if s[i] != p {
+			return false
+		}
+	}
 	return true
 }
 
-func sysargs(argc int32, argv **byte) {
-	n := argc + 1
+var pid = []byte("#c/pid\x00")
 
-	// skip over argv, envp to get to auxv
-	for argv_index(argv, n) != nil {
-		n++
+func getpid() uint64 {
+	var b [20]byte
+	fd := open(&pid[0], 0, 0)
+	if fd >= 0 {
+		read(fd, unsafe.Pointer(&b), int32(len(b)))
+		closefd(fd)
 	}
-
-	// skip NULL separator
-	n++
-
-	// now argv+n is auxv
-	auxvp := (*[1 << 28]uintptr)(add(unsafe.Pointer(argv), uintptr(n)*goarch.PtrSize))
-	pairs := sysauxv(auxvp[:])
-	auxv = auxvp[: pairs*2 : pairs*2]
+	c := b[:]
+	for c[0] == ' ' || c[0] == '\t' {
+		c = c[1:]
+	}
+	return uint64(_atoi(c))
 }
 
-const (
-	_AT_NULL     = 0  // Terminates the vector
-	_AT_PAGESZ   = 6  // Page size in bytes
-	_AT_TIMEKEEP = 22 // Pointer to timehands.
-	_AT_HWCAP    = 25 // CPU feature flags
-	_AT_HWCAP2   = 26 // CPU feature flags 2
-)
+func osinit() {
+	physPageSize = getPageSize()
+	initBloc()
+	ncpu = getproccount()
+	getg().m.procid = getpid()
+}
 
-func sysauxv(auxv []uintptr) (pairs int) {
-	var i int
-	for i = 0; auxv[i] != _AT_NULL; i += 2 {
-		tag, val := auxv[i], auxv[i+1]
-		switch tag {
-		// _AT_NCPUS from auxv shouldn't be used due to golang.org/issue/15206
-		case _AT_PAGESZ:
-			physPageSize = val
-		case _AT_TIMEKEEP:
-			timekeepSharedPage = (*vdsoTimekeep)(unsafe.Pointer(val))
+//go:nosplit
+func crash() {
+	notify(nil)
+	*(*int)(nil) = 0
+}
+
+//go:nosplit
+func getRandomData(r []byte) {
+	// inspired by wyrand see hash32.go for detail
+	t := nanotime()
+	v := getg().m.procid ^ uint64(t)
+
+	for len(r) > 0 {
+		v ^= 0xa0761d6478bd642f
+		v *= 0xe7037ed1a0b428db
+		size := 8
+		if len(r) < 8 {
+			size = len(r)
 		}
-
-		archauxv(tag, val)
-	}
-	return i / 2
-}
-
-// sysSigaction calls the sigaction system call.
-//
-//go:nosplit
-func sysSigaction(sig uint32, new, old *sigactiont) {
-	// Use system stack to avoid split stack overflow on amd64
-	if asmSigaction(uintptr(sig), new, old) != 0 {
-		systemstack(func() {
-			throw("sigaction failed")
-		})
+		for i := 0; i < size; i++ {
+			r[i] = byte(v >> (8 * i))
+		}
+		r = r[size:]
+		v = v>>32 | v<<32
 	}
 }
 
-// asmSigaction is implemented in assembly.
-//
-//go:noescape
-func asmSigaction(sig uintptr, new, old *sigactiont) int32
-
-// raise sends a signal to the calling thread.
-//
-// It must be nosplit because it is used by the signal handler before
-// it definitely has a Go stack.
-//
-//go:nosplit
-func raise(sig uint32) {
-	thr_kill(thr_self(), int(sig))
-}
-
-func signalM(mp *m, sig int) {
-	thr_kill(thread(mp.procid), sig)
-}
-
-// sigPerThreadSyscall is only used on linux, so we assign a bogus signal
-// number.
-const sigPerThreadSyscall = 1 << 31
-
-//go:nosplit
-func runPerThreadSyscall() {
-	throw("runPerThreadSyscall only valid on linux")
-}
-
-//go:nosplit
-//go:nowritebarrierrec
-func setsig(i uint32, fn uintptr) {
-	var sa sigactiont
-	sa.sa_flags = _SA_SIGINFO | _SA_ONSTACK | _SA_RESTART
-	sa.sa_mask = sigset_all
-	if fn == abi.FuncPCABIInternal(sighandler) { // abi.FuncPCABIInternal(sighandler) matches the callers in signal_unix.go
-		fn = abi.FuncPCABI0(sigtramp)
+func initsig(preinit bool) {
+	if !preinit {
+		notify(unsafe.Pointer(abi.FuncPCABI0(sigtramp)))
 	}
-	sa.sa_handler = fn
-	sigaction(i, &sa, nil)
 }
 
-func archauxv(tag, val uintptr) {
+//go:nosplit
+func osyield() {
+	sleep(0)
+}
+
+//go:nosplit
+func osyield_no_g() {
+	osyield()
+}
+
+//go:nosplit
+func usleep(µs uint32) {
+	ms := int32(µs / 1000)
+	if ms == 0 {
+		ms = 1
+	}
+	sleep(ms)
+}
+
+//go:nosplit
+func usleep_no_g(usec uint32) {
+	usleep(usec)
+}
+
+//go:nosplit
+func nanotime1() int64 {
+	var scratch int64
+	ns := nsec(&scratch)
+	// TODO(aram): remove hack after I fix _nsec in the pc64 kernel.
+	if ns == 0 {
+		return scratch
+	}
+	return ns
+}
+
+var goexits = []byte("go: exit ")
+var emptystatus = []byte("\x00")
+var exiting uint32
+
+func goexitsall(status *byte) {
+	var buf [_ERRMAX]byte
+	if !atomic.Cas(&exiting, 0, 1) {
+		return
+	}
+	getg().m.locks++
+	n := copy(buf[:], goexits)
+	n = copy(buf[n:], gostringnocopy(status))
+	pid := getpid()
+	for mp := (*m)(atomic.Loadp(unsafe.Pointer(&allm))); mp != nil; mp = mp.alllink {
+		if mp.procid != 0 && mp.procid != pid {
+			postnote(mp.procid, buf[:])
+		}
+	}
+	getg().m.locks--
+}
+
+var procdir = []byte("/proc/")
+var notefile = []byte("/note\x00")
+
+func postnote(pid uint64, msg []byte) int {
+	var buf [128]byte
+	var tmp [32]byte
+	n := copy(buf[:], procdir)
+	n += copy(buf[n:], itoa(tmp[:], pid))
+	copy(buf[n:], notefile)
+	fd := open(&buf[0], _OWRITE, 0)
+	if fd < 0 {
+		return -1
+	}
+	len := findnull(&msg[0])
+	if write1(uintptr(fd), unsafe.Pointer(&msg[0]), int32(len)) != int32(len) {
+		closefd(fd)
+		return -1
+	}
+	closefd(fd)
+	return 0
+}
+
+//go:nosplit
+func exit(e int32) {
+	var status []byte
+	if e == 0 {
+		status = emptystatus
+	} else {
+		// build error string
+		var tmp [32]byte
+		sl := itoa(tmp[:len(tmp)-1], uint64(e))
+		// Don't append, rely on the existing data being zero.
+		status = sl[:len(sl)+1]
+	}
+	goexitsall(&status[0])
+	exits(&status[0])
+}
+
+// May run with m.p==nil, so write barriers are not allowed.
+//
+//go:nowritebarrier
+func newosproc(mp *m) {
+	if false {
+		print("newosproc mp=", mp, " ostk=", &mp, "\n")
+	}
+	pid := rfork(_RFPROC | _RFMEM | _RFNOWAIT)
+	if pid < 0 {
+		throw("newosproc: rfork failed")
+	}
+	if pid == 0 {
+		tstart_plan9(mp)
+	}
+}
+
+func exitThread(wait *atomic.Uint32) {
+	// We should never reach exitThread on Plan 9 because we let
+	// the OS clean up threads.
+	throw("exitThread")
+}
+
+//go:nosplit
+func semacreate(mp *m) {
+}
+
+//go:nosplit
+func semasleep(ns int64) int {
+	gp := getg()
+	if ns >= 0 {
+		ms := timediv(ns, 1000000, nil)
+		if ms == 0 {
+			ms = 1
+		}
+		ret := plan9_tsemacquire(&gp.m.waitsemacount, ms)
+		if ret == 1 {
+			return 0 // success
+		}
+		return -1 // timeout or interrupted
+	}
+	for plan9_semacquire(&gp.m.waitsemacount, 1) < 0 {
+		// interrupted; try again (c.f. lock_sema.go)
+	}
+	return 0 // success
+}
+
+//go:nosplit
+func semawakeup(mp *m) {
+	plan9_semrelease(&mp.waitsemacount, 1)
+}
+
+//go:nosplit
+func read(fd int32, buf unsafe.Pointer, n int32) int32 {
+	return pread(fd, buf, n, -1)
+}
+
+//go:nosplit
+func write1(fd uintptr, buf unsafe.Pointer, n int32) int32 {
+	return pwrite(int32(fd), buf, n, -1)
+}
+
+var _badsignal = []byte("runtime: signal received on thread not created by Go.\n")
+
+// This runs on a foreign stack, without an m or a g. No stack split.
+//
+//go:nosplit
+func badsignal2() {
+	pwrite(2, unsafe.Pointer(&_badsignal[0]), int32(len(_badsignal)), -1)
+	exits(&_badsignal[0])
+}
+
+func raisebadsignal(sig uint32) {
+	badsignal2()
+}
+
+func _atoi(b []byte) int {
+	n := 0
+	for len(b) > 0 && '0' <= b[0] && b[0] <= '9' {
+		n = n*10 + int(b[0]) - '0'
+		b = b[1:]
+	}
+	return n
+}
+
+func signame(sig uint32) string {
+	if sig >= uint32(len(sigtable)) {
+		return ""
+	}
+	return sigtable[sig].name
+}
+
+const preemptMSupported = false
+
+func preemptM(mp *m) {
+	// Not currently supported.
+	//
+	// TODO: Use a note like we use signals on POSIX OSes
 }
